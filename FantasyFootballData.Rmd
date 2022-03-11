@@ -1,0 +1,863 @@
+---
+title: "FantasyFootballPredictor"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Cov}{\mathrm{Cov}}
+\newcommand{\diag}{\mathrm{diag}}
+\newcommand{\Corr}{\mathrm{Corr}}
+\newcommand{\Var}{\mathrm{Var}}
+\newcommand{\fix}[1]{\textcolor{red}{\textbf{\large (#1)\normalsize}}}
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages(library(knitr)) #makes pdfs
+suppressPackageStartupMessages(library(latex2exp))
+suppressPackageStartupMessages(library(tidyverse)) #good library for data manipulation, includes dplyr and ggplot
+# you can read more about the tidyverse at: https://r4ds.had.co.nz/
+suppressPackageStartupMessages(library(Lahman)) #good library for baseball
+suppressPackageStartupMessages(library(car)) #to check variance inflation
+suppressPackageStartupMessages(library(nflfastR)) 
+suppressPackageStartupMessages(library(janitor)) 
+suppressPackageStartupMessages(library(glue)) 
+suppressPackageStartupMessages(library(stringr)) 
+suppressPackageStartupMessages(library(rvest)) 
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(party))
+suppressPackageStartupMessages(library(randomForest))
+suppressPackageStartupMessages(library(sjmisc))
+install.packages("plyr")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+## R Markdown
+PLAYER DATASET
+```{r}
+df <- load_player_stats(c(2018,2019,2021))
+df <- filter(df, completions < 2, carries > 5)
+team_abb <- read.csv('nfl_teams.csv')
+team_abb <- select(team_abb, Name, Abbreviation)
+names(team_abb) <- c('team', 'recent_team')
+rushingStats <- merge(df, team_abb, by = 'recent_team')
+rushingStats <- select(rushingStats, 1:6, 22:28, 42, 49)
+rushingStats$team <- word(rushingStats$team, -1)
+playerData <- select(rushingStats, player_name, team, season, week, 
+                     carries, rushing_yards, rushing_tds, fantasy_points)
+head(playerData)
+```
+
+
+
+
+FUNCTIONS TO FIND PLAYERS TOTAL STAT UP TO THAT WEEK
+YARDS
+```{r}
+func_total_yards <- function(weeks, playerName, team_) {
+  upToWeek <- filter(rushingStats, week < weeks, player_name == playerName, 
+                     team == team_)
+  return(mean(upToWeek$rushing_yards))
+}
+```
+
+CARRIES
+```{r}
+func_total_carries <- function(weeks, playerName, team_) {
+  upToWeek <- filter(rushingStats, week < weeks, player_name == playerName, 
+                     team == team_)
+  return(mean(upToWeek$carries))
+}
+```
+
+TDS
+```{r}
+func_total_tds <- function(weeks, playerName, team_) {
+  upToWeek <- filter(rushingStats, week < weeks, player_name == playerName,
+                     team == team_)
+  return(mean(upToWeek$rushing_tds))
+}
+```
+
+
+
+FUNCTIONS TO CALCULATE PLAYERS AVERAGE STAT PAST 5 WEEKS
+L5 AVG YARDS
+```{r}
+func_five_yards <- function(weeks, playerName, team_) {
+  upToWeek <- filter(rushingStats, week < weeks, week > weeks-6,
+                     player_name == playerName, team == team_)
+  return(mean(upToWeek$rushing_yards))
+}
+```
+
+L5 AVG CARRIES
+```{r}
+func_five_carries <- function(weeks, playerName, team_) {
+  upToWeek <- filter(rushingStats, week < weeks, week > weeks-6,
+                     player_name == playerName, team == team_)
+  return(mean(upToWeek$carries))
+}
+```
+
+L5 AVG TDS
+```{r}
+func_five_tds <- function(weeks, playerName, team_) {
+  upToWeek <- filter(rushingStats, week < weeks, week > weeks-6,
+                     player_name == playerName, team == team_)
+  return(mean(upToWeek$rushing_tds))
+}
+```
+
+
+Adding in last 5 game data
+```{r}
+attach(playerData)
+playerData <- mutate(playerData, 
+                  avgYardsSF = mapply(func_total_yards, week, player_name, team),
+                  avgCarriesSF = mapply(func_total_carries, week, player_name, team),
+                  avgTDSF = mapply(func_total_tds, week, player_name, team),
+                  L5AVGYards = mapply(func_five_yards, week, player_name, team),
+                  L5AVGCarries = mapply(func_five_carries, week, player_name, team),
+                  L5AVGTDS = mapply(func_five_tds, week, player_name, team))
+head(playerData)
+```
+
+
+
+```{r}
+attach(playerData)
+playerData <- mutate(playerData, avgYPC = avgYardsSF / avgCarriesSF)
+playerData <- mutate(playerData, L5YPC = L5AVGYards / L5AVGCarries)
+playerData$YPC <- rushing_yards/carries
+head(playerData)
+```
+
+
+
+
+
+<!-- ```{r} -->
+<!-- draft_picks <- read_csv("https://raw.githubusercontent.com/leesharpe/nfldata/master/data/draft_picks.csv") -->
+<!-- draft_picks <- filter(draft_picks, season > 1995, position == 'RB') -->
+<!-- draft_picks$pickNumber <- (draft_picks$round-1)*32 + draft_picks$pick -->
+<!-- draft_picks <- select(draft_picks, pfr_name, pickNumber) -->
+<!-- ``` -->
+
+
+
+<!-- ```{r} -->
+<!-- attach(draft_picks) -->
+<!-- draft_picks <- mutate(draft_picks,  -->
+<!--                       player_name = paste(str_sub(pfr_name, 1,1),  -->
+<!--                                           word(pfr_name,-1), sep = ".")) -->
+<!-- draft_picks <- select(draft_picks, player_name, pickNumber) -->
+<!-- ``` -->
+
+
+<!-- ```{r} -->
+<!-- playerData <- left_join(playerData, draft_picks) -->
+<!-- head(playerData) -->
+<!-- ``` -->
+
+
+
+GAME DATASET 
+https://jakesdatalab.com/post/gathering-historical-nfl-weather-data/
+```{r} 
+weeks <- c(1:17)
+years <- c(2018,2019,2021)
+weather_weeks_and_years <- crossing(year = years, week = weeks) # generate all unique combinations
+
+# function to generate urls
+generate_urls <- function(year, week) {
+  full_url <- glue::glue("http://nflweather.com/en/week/{year}/week-{week}/")
+}
+
+# pass weeks and years through function
+url_list <- pmap(weather_weeks_and_years, generate_urls)
+head(url_list)
+```
+
+
+
+```{r}
+scrape_weather_data <- function(webpage_url) {
+  webpage_url %>% 
+    read_html() %>% 
+    html_table() %>%
+    .[[1]] %>% 
+    clean_names() %>%
+    select(away, home, forecast, wind) %>%
+    mutate(season = str_sub(webpage_url, start= 31, end = 34),
+           week = str_sub(gsub('.*\\-', '', webpage_url), start = -3, end = -2),
+           wind = as.numeric(gsub( "m.*$", "",wind)),
+           temperature = ifelse(forecast == 'DOME', 71, gsub( "f.*$", "", forecast)),
+           weather = gsub(".*? ", "", forecast)) %>%
+    pivot_longer(cols = c('away', 'home'), values_to = 'team') %>% 
+    select(-name, -forecast) %>% 
+    select(team, season, week, temperature, wind, weather)
+}
+```
+
+```{r}
+weather_data <- map_df(url_list, scrape_weather_data)
+weather_data
+```
+
+
+GAME DATA
+```{r}
+game_data <- read.csv('spreadspoke_scores.csv')
+game_data <- filter(game_data, schedule_season > 2008)
+game_data <- mutate(game_data, home = word(game_data$team_home,-1), 
+                    away = word(game_data$team_away, -1))
+game_data <- game_data %>% 
+  pivot_longer(cols = c('team_away', 'team_home'), values_to = 'team') %>%
+  select(team, schedule_season, schedule_week, team_favorite_id, spread_favorite,
+         over_under_line, weather_temperature, home, away)
+game_data <- rename(game_data, recent_team = team_favorite_id)
+team_abb <- read.csv('nfl_teams.csv')
+team_abb <- select(team_abb, Name, Abbreviation)
+names(team_abb) <- c('Favorite', 'recent_team')
+game_data <- merge(game_data, team_abb, by = 'recent_team')
+game_data$spread_favorite <- ifelse(game_data$team == game_data$Favorite, 
+                    game_data$spread_favorite, game_data$spread_favorite * -1)
+game_data <- rename(game_data, season = schedule_season, week = schedule_week,
+                    spread = spread_favorite)
+game_data$team <- word(game_data$team,-1)
+game_data <- merge(game_data, weather_data, by = c('season', 'week', 'team'))
+game_data <- select(game_data, -c('recent_team', 'weather_temperature'))
+game_data$proj_team_points <- game_data$over_under_line / 2 + ((-1/2) *
+                                            game_data$spread)
+game_data$opponent <- ifelse(game_data$team == game_data$home, game_data$away,
+                             game_data$home)
+game_data <- select(game_data, -c(home, away))
+game_data$week <- as.numeric(game_data$week)
+head(game_data)
+```
+
+
+
+
+
+TEAM DATASET
+```{r}
+data <- load_pbp(c(2018,2019,2021))
+attach(data)
+data$season = substr(game_id,0,4)
+data$week <- substr(game_id,5,7)
+data$count <- 1
+data$season <- substr(data$game_id,0,4)
+rushPlays <- filter(data, play_type == "run", qb_scramble == 0)
+head(rushPlays)
+```
+
+```{r}
+func_avg_run_rate <- function(weeks, dteam) {
+  upToWeek <- filter(dRunRate, week < weeks, team == dteam)
+  return(mean(upToWeek$dRunRate))
+}
+```
+
+```{r}
+func_five_run_rate <- function(weeks, dteam) {
+  upToWeek <- filter(dRunRate, week < weeks, week > weeks-6, team == dteam)
+  return(mean(upToWeek$dRunRate))
+}
+```
+
+
+
+
+```{r}
+offensive_plays <- filter(data, play_type == 'run' | play_type == 'pass')
+offensive_plays$play_type <- ifelse(offensive_plays$qb_scramble == 1, 
+                                    'pass', offensive_plays$play_type)
+head(offensive_plays)
+```
+
+```{r}
+defense <- offensive_plays %>% group_by(defteam, season, week)
+defense$week <- as.numeric(str_sub(defense$week,2))
+dRunRate <- as.data.frame(summarise(defense, sum(play_type == 'run') / (
+  sum(play_type == 'run') + sum(play_type == 'pass'))))
+names(dRunRate) = c('team', 'season', 'week', 'dRunRate')
+head(dRunRate)
+```
+
+
+```{r}
+dfunc_avg_run_rate <- function(weeks, dteam) {
+  upToWeek <- filter(dRunRate, week < weeks, team == dteam)
+  return(mean(upToWeek$dRunRate))
+}
+```
+
+
+```{r}
+dfunc_five_run_rate <- function(weeks, dteam) {
+  upToWeek <- filter(dRunRate, week < weeks, week > weeks-6,
+                     team == dteam)
+  return(mean(upToWeek$dRunRate))
+}
+```
+
+```{r}
+attach(dRunRate)
+dRunRate <- mutate(dRunRate, 
+                   dRunRate = mapply(dfunc_avg_run_rate, week, team),
+                   dL5_runRate = mapply(dfunc_five_run_rate, week, team))
+dRunRate
+```
+
+
+```{r}
+offense <- offensive_plays %>% group_by(posteam, week)
+offense$week <- as.numeric(str_sub(offense$week,2))
+oRunRate <- as.data.frame(summarise(offense, sum(play_type == 'run') / (
+  sum(play_type == 'run') + sum(play_type == 'pass'))))
+names(oRunRate) = c('team', 'week', 'o_run_rate')
+```
+
+```{r}
+ofunc_avg_run_rate <- function(weeks, dteam) {
+  upToWeek <- filter(oRunRate, week < weeks, team == dteam)
+  return(mean(upToWeek$o_run_rate))
+}
+```
+
+
+```{r}
+ofunc_five_run_rate <- function(weeks, dteam) {
+  upToWeek <- filter(oRunRate, week < weeks, week > weeks-6, team == dteam)
+  return(mean(upToWeek$o_run_rate))
+}
+```
+
+
+```{r}
+attach(oRunRate)
+RunRate <- mutate(dRunRate, 
+                   Oavg_runRateSF = mapply(ofunc_avg_run_rate, week, team),
+                   OL5_runRate = mapply(ofunc_five_run_rate, week, team))
+
+head(RunRate)
+```
+
+
+Defensive Stats
+```{r}
+opp_def <- rushPlays %>% group_by(season, defteam, week)
+opp_def$week <- as.numeric(str_sub(opp_def$week, 2))
+defSeasonYards <- summarize(opp_def, sum(yards_gained))
+defYPG <- as.data.frame(defSeasonYards)
+defCPG <- as.data.frame(summarise(opp_def, sum(count)))
+names(defYPG) <- c('season', 'team', 'week', 'yards_allowed')
+names(defCPG) <- c('season', 'team', 'week', 'carries_allowed')
+defStats <- merge(defYPG, defCPG, by = c('season', 'team', 'week'))
+head(defStats)
+```
+
+Function to calculate team total rushing yards up to that week
+```{r}
+attach(defStats)
+func_avg_dyards <- function(weeks, dteam) {
+  upToWeek <- filter(defStats, week < weeks, team == dteam)
+  return(mean(upToWeek$yards_allowed))
+}
+```
+
+Function to calculate teams carries allowed up to that week
+```{r}
+func_avg_dcarries <- function(weeks, dteam) {
+  upToWeek <- filter(defStats, week < weeks, team == dteam)
+  return(mean(upToWeek$carries_allowed))
+}
+```
+
+Function to calculate teams total yards allowed past 5 weeks
+```{r}
+func_five_dyards <- function(weeks, dteam) {
+  upToWeek <- filter(defStats, week < weeks, week > weeks-6,
+                     team == dteam)
+  return(mean(upToWeek$yards_allowed))
+}
+```
+
+Function to calculate teams total carries allowed past 5 weeks
+```{r}
+func_five_dcarries <- function(weeks, dteam) {
+  upToWeek <- filter(defStats, week < weeks, week > weeks-6,
+                     team == dteam)
+  return(mean(upToWeek$carries_allowed))
+}
+```
+
+
+
+```{r}
+attach(defStats)
+defStats <- mutate(defStats, 
+                  avgYardsAllowed = mapply(func_avg_dyards, week, team),
+                  avgCarriesAllowed= mapply(func_avg_dcarries, week, team),
+                  avgL5YardsAllowed = mapply(func_five_dyards, week, team),
+                  avgL5CarriesAllowed = mapply(func_five_dcarries, week, team))
+head(defStats)
+```
+
+
+
+```{r}
+team_Stats <- merge(defStats, RunRate, by = c('season', 'team', 'week'))
+head(team_Stats)
+team_Stats <- select(team_Stats, 1:3, 6:13)
+team_Stats <- team_Stats[order(team, week),]
+merging <- team_abb
+names(merging) <- c('teamFull', 'team')
+team_Stats <- merge(merging, team_Stats, by = 'team')
+team_Stats <- select(team_Stats, -team)
+team_Stats <- rename(team_Stats, opponent = teamFull)
+team_Stats$opponent <- word(team_Stats$opponent,-1)
+team_Stats <- mutate(team_Stats, 
+                     avg_ypc_allowed = avgYardsAllowed/avgCarriesAllowed,
+                     L5_ypc_allowed = avgL5YardsAllowed / avgL5CarriesAllowed)
+head(team_Stats)
+```
+
+
+```{r}
+func_findPlayer <- function(description){
+  vec <- unlist(str_split(description, " "))
+  for(i in 1:length(vec)){
+    if(vec[i] == "left" || vec[i] == "up" || vec[i] == "right") {
+      break
+    }
+  }
+  return(vec[i-1])
+}
+```
+
+```{r}
+goalLine <- filter(rushPlays, goal_to_go == 1, ydstogo < 5)
+goalLine <- mutate(goalLine, player = mapply(func_findPlayer, goalLine$desc),
+                   season = str_sub(game_id,1,4))
+goalLine <- filter(goalLine, str_sub(player,2,2) == '0' | str_sub(player,2,2) == "1" | 
+                   str_sub(player,2,2) == "2" |  str_sub(player,2,2) == "3" |
+                   str_sub(player,2,2) == "4" | str_sub(player,2,2) == "5" | 
+                   str_sub(player,2,2) == "6" | str_sub(player,2,2) == "7" | 
+                   str_sub(player,2,2) == "8" | str_sub(player,2,2) == "9")
+goalLine$player_name = str_sub(goalLine$player,4,-1)
+goalLine$ydLine = word(goalLine$yrdln,-1)
+goalLine <- select(goalLine, posteam, week, season, player_name, ydLine)
+goalLine$goalLineCarry = 1
+goalLine$week <- as.numeric(str_sub(goalLine$week,2,-1))
+goalLine <- rename(goalLine, team = posteam)
+goalLine
+
+```
+
+
+```{r}
+names(merging) <- c('teamFull', 'team')
+goalLine <- merge(merging, goalLine, by = 'team')
+goalLine <- select(goalLine, -team)
+goalLine <- rename(goalLine, team = teamFull)
+goalLine$team <- word(goalLine$team,-1)
+goalLine <- unique(goalLine)
+goalLine <- group_by(goalLine, player_name, season, week, team)
+goalLine <- as.data.frame(summarise(goalLine, sum(goalLineCarry)))
+names(goalLine) <- c("player_name", "season", "week", "team", "goalLineCarry")
+goalLine$season <- as.numeric(goalLine$season)
+head(goalLine)
+```
+
+
+```{r}
+playerData <- left_join(playerData, goalLine, by = c("player_name", "team", "season", "week"))
+playerData$goalLineCarry <- ifelse(is.na(playerData$goalLineCarry), 0, playerData$goalLineCarry)
+head(playerData)
+```
+
+
+```{r}
+func_avg_glCarries <- function(weeks, playerName, teams, seasons) {
+  upToWeek <- filter(playerData, week < weeks, team == teams, 
+                     player_name == playerName, season == seasons)
+  return(mean(upToWeek$goalLineCarry))
+}
+```
+
+```{r}
+func_five_glCarries <- function(weeks, playerName, teams, seasons) {
+  upToWeek <- filter(playerData, week < weeks, week > weeks-6,
+                     team == teams, player_name == playerName, season == seasons)
+  return(mean(upToWeek$goalLineCarry))
+}
+```
+
+
+```{r}
+playerData <- mutate(playerData, 
+          avgGLC = mapply(func_avg_glCarries, week, player_name, team, season),
+          L5GLC = mapply(func_five_glCarries, week, player_name, team, season))
+head(playerData)
+```
+
+
+
+EXPECTED CARRIES DATASET
+```{r}
+expected_carries <- select(playerData, player_name, team, season, week, 
+                           avgCarriesSF, L5AVGCarries, carries, fantasy_points)
+game_team <- merge(game_data, select(team_Stats, opponent, week, 
+            avgCarriesAllowed, avgL5CarriesAllowed, dRunRate, dL5_runRate), 
+            by = c('week', 'opponent'))
+expected_carries <- merge(expected_carries, game_team, by = c('season','week','team'))
+expected_carries <- expected_carries[order(expected_carries$player_name),]
+expected_carries <- expected_carries %>% relocate(player_name)
+expected_carries <- filter(expected_carries, week >= 6)
+expected_carries <- unique(expected_carries)
+expected_carries  <- na.omit(expected_carries)
+expected_carries
+```
+
+```{r}
+carries_train_data <- filter(expected_carries, season == 2018 | season == 2019)
+carries_test_data <- filter(expected_carries, season == 2021)
+head(carries_train_data)
+head(carries_test_data)
+```
+
+```{r}
+rf_carries_model <- randomForest(carries ~ avgCarriesSF + L5AVGCarries + spread + temperature +
+                                 wind + weather + avgCarriesAllowed + avgL5CarriesAllowed + dRunRate +
+                                 dL5_runRate, data = carries_train_data, mtry = 2)
+rf_carries_model <- tuneRF(select(carries_train_data, avgCarriesSF, L5AVGCarries, spread, temperature,
+                                 wind, weather, avgCarriesAllowed, avgL5CarriesAllowed, dRunRate,
+                                 dL5_runRate), carries_train_data$carries,  doBest = TRUE)
+rf_carries_model
+carries_train_data$expectedCarries <- predict(rf_carries_model, carries_train_data)
+carries_test_data$expectedCarries <- predict(rf_carries_model, carries_test_data)
+carries_test_data$c = carries_test_data$carries
+carries_test_data
+```
+```{r}
+team_Stats
+```
+
+
+EXPECTED RUSH YDS PER CARRY DATASET
+```{r}
+expected_YPC <- select(playerData, player_name, team, season, week, 
+                           avgYPC, L5YPC, YPC)
+game_team_YPC <- merge(game_data, select(team_Stats, opponent, week, 
+            avg_ypc_allowed, L5_ypc_allowed), by = c('week', 'opponent'))
+game_team_YPC
+expected_YPC <- merge(expected_YPC, game_team_YPC, by = c('season', 'week','team')) 
+game_team_YPC
+expected_YPC <- unique(expected_YPC) 
+expected_YPC <- filter(expected_YPC, week >= 6)
+expected_YPC <- expected_YPC[order(expected_carries$player_name),]
+expected_YPC <- expected_YPC %>% relocate(player_name)
+expected_YPC <- na.omit(expected_YPC)
+expected_YPC
+```
+
+```{r}
+ypc_train_data <- filter(expected_YPC, season == 2018 | season == 2019)
+ypc_test_data <- filter(expected_YPC, season == 2021)
+ypc_train_data
+ypc_test_data
+```
+
+```{r}
+rf_ypc_model <- tuneRF(select(ypc_train_data, avgYPC, L5YPC, spread, proj_team_points,
+                                 wind, weather, avg_ypc_allowed,  
+                               L5_ypc_allowed), ypc_train_data$YPC, doBest = TRUE)
+rf_ypc_model <- randomForest(YPC ~ avgYPC + L5YPC + spread + proj_team_points +
+                                 wind + weather + avg_ypc_allowed + 
+                               L5_ypc_allowed, data = ypc_train_data, mtry =1)
+rf_ypc_model
+ypc_train_data$expectedYPC <- predict(rf_ypc_model, ypc_train_data)
+ypc_test_data$expectedYPC <- predict(rf_ypc_model, ypc_test_data)
+ypc_test_data$ypc = ypc_test_data$YPC
+ypc_test_data
+```
+
+
+```{r}
+expected_TDS <- select(playerData, player_name, team, season, week, 
+                        avgTDSF, L5AVGTDS, avgGLC, L5GLC,
+                       rushing_tds)
+expected_TDS <- merge(expected_TDS, game_team_YPC, by = c('season', 'week','team')) 
+expected_TDS <- unique(expected_TDS) 
+expected_TDS <- filter(expected_TDS, week >= 6)
+expected_TDS <- expected_TDS[order(expected_carries$player_name),]
+expected_TDS <- expected_TDS %>% relocate(player_name)
+expected_TDS <- na.omit(expected_TDS)
+expected_TDS
+```
+
+```{r}
+td_train_data <- filter(expected_TDS, season == 2018 | season == 2019)
+td_test_data <- filter(expected_TDS, season == 2021)
+td_train_data
+td_test_data
+```
+
+
+```{r}
+rf_td_model <- tuneRF(select(td_train_data, avgTDSF, L5AVGTDS, avgGLC, proj_team_points,
+                                 wind, weather, avg_ypc_allowed, 
+                               L5_ypc_allowed), td_train_data$rushing_tds, doBest = TRUE)
+rf_td_model <- randomForest(rushing_tds ~ avgTDSF + L5AVGTDS + avgGLC + proj_team_points +
+                                 wind + weather + avg_ypc_allowed + 
+                               L5_ypc_allowed, data = td_train_data, mtry = 2)
+rf_td_model
+td_test_data$expectedTDS <- predict(rf_td_model, td_test_data)
+td_test_data$tds = td_test_data$rushing_tds
+td_test_data
+```
+
+```{r}
+func_avg_fantasy_points <- function(weeks, playerName, dteam, season) {
+  upToWeek <- filter(playerData, week < weeks, team == dteam)
+  return(mean(upToWeek$fantasy_points))
+}
+```
+
+```{r}
+func_avg_fantasy_points(4, "D.Johnson", "Cardinals", 2018)
+```
+
+```{r}
+expected_carries$expectedCarries <- predict(rf_carries_model, expected_carries)
+expected_TDS$expectedTDS <- predict(rf_td_model, expected_TDS)
+expected_YPC$expectedYPC <- predict(rf_ypc_model, expected_YPC)
+```
+
+
+```{r}
+func_L5_fantasy_points <- function(weeks, playerName, dteam, seasons) {
+  upToWeek <- filter(playerData, week < weeks, week > weeks-6, 
+                     player_name == playerName, team == dteam, season == seasons)
+  return(mean(upToWeek$fantasy_points))
+}
+```
+
+
+```{r}
+expectedStats <- left_join(expected_carries, expected_TDS, 
+                           by = c("player_name", "team", "season", "week"))
+expectedStats <- left_join(expectedStats, expected_YPC, by = c("player_name", "team", "season", "week"))
+expectedStats <- select(expectedStats, player_name, team, season, week, expectedCarries, expectedYPC, expectedTDS)
+```
+
+
+
+
+```{r}
+attach(expectedStats)
+expectedStats$expectedFantasyPoints <- expectedCarries*expectedYPC/10 + 6*expectedTDS
+expectedStats <- filter(expectedStats, !is.na(expectedFantasyPoints))
+head(expectedStats)
+```
+
+
+```{r}
+fantasy_model <- select(expected_carries, player_name, team, season, week, fantasy_points)
+fantasy_model <- left_join(fantasy_model, expectedStats, by = c("player_name", "team", "season", "week"))
+fantasy_model <- mutate(fantasy_model, 
+                  avgFantasyPoints = mapply(func_avg_fantasy_points, week, 
+                                            player_name, team, season),
+                  L5FantasyPoints = mapply(func_L5_fantasy_points, week, 
+                                           player_name, team, season))
+fantasy_model <- select(fantasy_model, player_name, team, season, week, fantasy_points,
+                        expectedFantasyPoints, avgFantasyPoints, L5FantasyPoints)
+fantasy_model <- filter(fantasy_model, !is.na(expectedFantasyPoints))
+fantasy_model_train <- filter(fantasy_model, season== 2018 | season == 2019)
+fantasy_model_test <- filter(fantasy_model, season == 2021)
+```
+
+```{r}
+rf_fantasy_model <- randomForest(fantasy_points ~ expectedFantasyPoints +
+                        avgFantasyPoints + L5FantasyPoints, data = fantasy_model_train)
+fantasy_model_test$predictedFantasyPoints <- predict(rf_fantasy_model, fantasy_model_test)
+fantasy_model$predictedFantasyPoints <- predict(rf_fantasy_model, fantasy_model)
+```
+
+```{r}
+mean((fantasy_model_test$predictedFantasyPoints - fantasy_model_test$fantasy_points)^2)
+mean((fantasy_model_test$expectedFantasyPoints - fantasy_model_test$fantasy_points)^2)
+mean((fantasy_model_train$expectedFantasyPoints - fantasy_model_train$fantasy_points)^2)
+```
+
+```{r}
+mean((filter(expected_carries, season == 2021)$expectedCarries -
+   filter(expected_carries, season == 2021)$carries)^2)
+mean((filter(expected_YPC, season == 2021)$expectedYPC -
+   filter(expected_YPC, season == 2021)$YPC)^2)
+mean((filter(expected_TDS, season == 2021)$expectedTDS -
+   filter(expected_TDS, season == 2021)$rushing_tds)^2)
+```
+
+
+PREDICTS WHIICH PLAYER
+```{r}
+func_predict_player <- function(player1, player1team, player2, player2team, weeks, seasons){
+  playerO <- filter(fantasy_model, player_name == player1, team == player1team, 
+                    week == weeks, season == seasons)
+  playerT <- filter(fantasy_model, player_name == player2, team == player2team,
+                    week == weeks, season == seasons)
+  if(sum(playerO$predictedFantasyPoints) > sum(playerT$predictedFantasyPoints)) {
+    return(player1)
+  }
+  else{
+    return(player2)
+  }
+}
+```
+
+
+```{r}
+func_predict_player("J.Taylor", "Colts", "B.Scott", "Eagles", 13, 2021)
+func_predict_player("A.Ekeler", "Chargers", "N.Chubb", "Browns", 15, 2021)
+```
+
+
+```{r}
+func_rank_players_predicted <- function(player, teams, weeks, seasons){
+  byWeek <- filter(fantasy_model, week == weeks, season == seasons)
+  byWeek$rank <- min_rank(desc(byWeek$predictedFantasyPoints))
+  result <- filter(byWeek, player_name == player, team == teams)
+  return(sum(result$rank))
+}
+```
+
+```{r}
+func_rank_players <- function(player, teams, weeks, seasons){
+  byWeek <- filter(fantasy_model, week == weeks, season == seasons)
+  byWeek$rank <- min_rank(desc(byWeek$fantasy_points))
+  result <- filter(byWeek, player_name == player, team == teams)
+  return(sum(result$rank))
+}
+```
+
+```{r}
+func_rank_players("J.Conner", "Cardinals", 9, 2021)
+```
+
+
+```{r}
+fantasy_model_train <- mutate(fantasy_model_train, 
+                  predictedRank = mapply(func_rank_players_predicted, player_name, team, week, season),
+                  rank = mapply(func_rank_players, player_name, team, week, season))
+fantasy_model_test <- mutate(fantasy_model_test, 
+                  predictedRank = mapply(func_rank_players_predicted, player_name, team, week, season),
+                  rank = mapply(func_rank_players, player_name, team, week, season))
+fantasy_model_test
+```
+
+```{r}
+mean((fantasy_model_test$predictedRank - fantasy_model_test$rank)^2)
+mean((fantasy_model_train$predictedRank - fantasy_model_train$rank)^2)
+```
+
+
+```{r}
+Ekeler <- select(filter(fantasy_model_test, player_name == "A.Ekeler"), player_name, week, season, fantasy_points, predictedFantasyPoints)
+Ekeler
+mean(Ekeler$fantasy_points)
+mean(Ekeler$predictedFantasyPoints)
+plot(Ekeler$week,Ekeler$fantasy_points,type="l",col="red")
+par(new = TRUE) %>%
+plot(Ekeler$week,Ekeler$predictedFantasyPoints,type="l",col="green")
+lines(Ekeler$week,Ekeler$predictedFantasyPoints,col="green")
+ggplot(Ekeler, aes(x = week, y = c(fantasy_points, predictedFantasyPoints)) + geom_point())
+
+ggplot(Ekeler, aes(week)) +                   
+  geom_point(aes(y= fantasy_points), color="blue") +  
+  geom_point(aes(y= predictedFantasyPoints), color="red") +
+  ylab("Points") +
+  ggtitle("Ekeler Points vs Predicted Points")
+
+```
+
+```{r}
+Javonte <- select(filter(fantasy_model_test, team == "Broncos", player_name == "J.Williams", week == 13), predictedFantasyPoints, fantasy_points)
+Javonte
+p <-ggplot(data=Javonte, aes(x= predictedFantasyPoints, fantasy_points)) +
+  geom_bar(stat="identity")
+barplot(as.matrix(Javonte), col= "blue",
+        ylab = "Points", main = "Javonte Williams Week 13 Prediction")
+```
+
+
+```{r}
+mean((filter(fantasy_model_test, player_name == "N.Harris")$predictedFantasyPoints - filter(fantasy_model_test, player_name == "N.Harris")$fantasy_points)^2)
+
+Harris <- filter(fantasy_model_test, player_name == "N.Harris")
+ggplot(Harris, aes(week)) +                   
+  geom_point(aes(y= fantasy_points), color="blue") +  
+  geom_point(aes(y= predictedFantasyPoints), color="red") +
+  ylab("Points") +
+  ggtitle("Najee Harris Points vs Predicted Points")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+ggplot(expected_carries, mapping = aes(x = expected_carries$carries, y = expected_carries$fantasy_points)) + geom_point() +
+xlab("carries") + ylab("Fantasy Points") + ggtitle("Carries vs Fantasy Points (2019)")
+```
+For our model, we are trying to predict a RBs fantasy points in a given week. This graph
+shows a correlation between the number of carries a RB gets and the number of 
+fantasy points that they score. This makes sense because the more carries they 
+get, the more opportunities they have to receive fantasy points. This information
+led us to breaking our model down into 3 different models: expected carries for
+that week, expected yards per carry for that week, expected TDs for that week.
+
+```{r}
+D_Hen <- filter(expected_carries, player_name == "D.Henry")
+D_Hen
+ggplot(D_Hen, mapping = aes(x = D_Hen$spread, y = D_Hen$carries)) + geom_point() +
+xlab("spread") + ylab("carries") + ggtitle("Derick Henry Spread vs Carries (2019)")
+```
+
+This graph takes Derick Henry's games from 2019 and plots his carries as a 
+function of the pregame spread. While it is a small sample size and the correlation
+is not perfect, there is  a general downward sloping trend. This makes sense
+because the lower the spread is for your team, the more likely your team is to 
+win. If you team is winning, then your team is more likely for you to run the 
+ball and for a player to get more carries. Therefore, when trying to predict 
+carries, our model should take into account the spread before the game.
+
+
+
+```{r}
+ggplot(expected_carries, mapping = aes(x = expected_carries$avgCarriesSF, y = expected_carries$carries)) + geom_point() +
+xlab("AVG Carries up to Week") + ylab("carries") + ggtitle("AVG Carries Up Top Week vs Carries (2019)")
+```
+This graph shows the correlation between a players average carries up to that 
+week and the amount of carries that they receive that week. This makes sense 
+to use for our model because taking into account their average carries up to 
+that week can help us predict their number of carries in that game.
+
+```{r}
+write.csv(expected_carries, file = "ExpectedCarries.csv")
+```
